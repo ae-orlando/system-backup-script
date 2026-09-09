@@ -71,8 +71,11 @@ The following are **not** automatically backed up. You must handle these separat
 ### Backup
 
 ```bash
-./backup-system.sh
+./backup-system.sh                    # Backs up to ~/system-backup-YYYYMMDD-HHMMSS/
+./backup-system.sh /path/to/backup    # Backs up to /path/to/backup/system-backup-YYYYMMDD-HHMMSS/
 ```
+
+If no argument is provided, it defaults to `$HOME`.
 
 This will:
 1. Create a timestamped directory: `~/system-backup-YYYYMMDD-HHMMSS/`

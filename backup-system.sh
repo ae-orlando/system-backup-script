@@ -23,7 +23,8 @@
 #   - A generated restore-script: <backup_dir>/restore-system.sh
 #
 # USAGE:
-#   ./backup-system.sh
+#   ./backup-system.sh                    # Backs up to ~/system-backup-...
+#   ./backup-system.sh /path/to/backup    # Backs up to /path/to/backup/system-backup-...
 #
 # RESTORE:
 #   1. Copy the tarball to the target machine
@@ -46,8 +47,9 @@
 # =============================================================================
 set -euo pipefail
 
+BACKUP_ROOT="${1:-$HOME}"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-BACKUP_DIR="$HOME/system-backup-$TIMESTAMP"
+BACKUP_DIR="$BACKUP_ROOT/system-backup-$TIMESTAMP"
 mkdir -p "$BACKUP_DIR"
 
 echo "=== Backing up system configuration ==="
