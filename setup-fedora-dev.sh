@@ -25,22 +25,40 @@
 #
 # OPTIONS:
 #   -y, --yes        Non-interactive (assume yes where prompted; still
-#                    prompts for sudo password once if needed)
+#                    prompts for sudo password once if needed).
+#                    NOTE: skips the 'p10k configure' wizard and the
+#                    'chsh' default-shell switch (printed as follow-ups).
 #   --docker         Install Docker CE and add user to docker group
 #   --no-docker      Skip Docker CE (default)
 #   --sdkman         Also install SDKMAN! in user space
 #   --no-sdkman      Skip SDKMAN! (default)
+#   --skip-upgrade   Skip the full 'dnf upgrade --refresh' (fast re-runs)
+#   --only a,b       Run only these sections (comma-separated):
+#                    tune,upgrade,repos,build,cli,editors,kitty,zsh,
+#                    node,python,rust,go,java,containers,virt,shells
+#                    (pre-flight, verification and summary always run)
+#   --dry-run        Print what would run without changing anything
+#   -v, --verbose    Trace execution (set -x) for debugging
 #   -h, --help       Show this help and exit
 #
 # ENV FLAGS (alternative to CLI flags):
 #   INSTALL_DOCKER=1  same as --docker   (default: 0)
 #   INSTALL_SDKMAN=1  same as --sdkman   (default: 0)
 #   NONINTERACTIVE=1  same as --yes      (default: 0)
+#   SKIP_UPGRADE=1    same as --skip-upgrade (default: 0)
+#   ONLY=a,b          same as --only (default: all sections)
+#   DRY_RUN=1         same as --dry-run (default: 0)
+#   VERBOSE=1         same as --verbose (default: 0)
+#   FLATPAK_APPS="id1 id2"  optional Flatpak app IDs to install (default: none)
+#   NERD_FONTS_REF=master   git ref for JetBrainsMono Nerd Font downloads
 #
 # EXAMPLES:
 #   ./setup-fedora-dev.sh
 #   INSTALL_DOCKER=1 ./setup-fedora-dev.sh -y
 #   ./setup-fedora-dev.sh --docker --sdkman
+#   ./setup-fedora-dev.sh --skip-upgrade
+#   ./setup-fedora-dev.sh --only kitty,zsh
+#   ./setup-fedora-dev.sh --dry-run
 #
 # REQUIREMENTS:
 #   - Run as a REGULAR user with sudo privileges (NEVER as root).
@@ -66,7 +84,34 @@ INSTALL_DOCKER="${INSTALL_DOCKER:-0}"
 INSTALL_SDKMAN="${INSTALL_SDKMAN:-0}"
 NONINTERACTIVE="${NONINTERACTIVE:-0}"
 MIN_DISK_GB="${MIN_DISK_GB:-20}"
+SKIP_UPGRADE="${SKIP_UPGRADE:-0}"
+ONLY="${ONLY:-}"
+DRY_RUN="${DRY_RUN:-0}"
+VERBOSE="${VERBOSE:-0}"
+FLATPAK_APPS="${FLATPAK_APPS:-}"
+NERD_FONTS_REF="${NERD_FONTS_REF:-master}"
 FEDORA_VERSION="$(rpm -E %fedora 2>/dev/null || echo "")"
+
+# Ordered install sections (tokens for --only). Verification/summary always run.
+_STEPS=(
+  "tune:DNF tuning (/etc/dnf/dnf.conf)"
+  "upgrade:Full system upgrade"
+  "repos:Repositories (RPM Fusion, OpenH264, Flathub)"
+  "build:Build essentials"
+  "cli:Modern CLI toolkit"
+  "editors:Neovim + kitty packages"
+  "kitty:Kitty config (Catppuccin, JetBrainsMono NF, default terminal)"
+  "zsh:Zsh + Oh My Zsh + Powerlevel10k"
+  "node:Node.js via fnm"
+  "python:Python via uv + pyenv"
+  "rust:Rust via rustup"
+  "go:Go toolchain"
+  "java:Java (OpenJDK, optional SDKMAN!)"
+  "containers:Podman stack (optional Docker CE)"
+  "virt:Virtualization (KVM/libvirt)"
+  "shells:Shell PATH + completion wiring"
+)
+VALID_ONLY_TOKENS="tune upgrade repos build cli editors kitty zsh node python rust go java containers virt shells"
 
 # Detect package manager: prefer dnf5 on Fedora >= 41, fall back to dnf.
 DNF_CMD="dnf"
@@ -142,9 +187,52 @@ parse_args() {
       --no-docker) INSTALL_DOCKER=0; shift ;;
       --sdkman) INSTALL_SDKMAN=1; shift ;;
       --no-sdkman) INSTALL_SDKMAN=0; shift ;;
+      --skip-upgrade) SKIP_UPGRADE=1; shift ;;
+      --only)
+        if [[ $# -lt 2 ]]; then log_error "--only requires a value (see --help)"; exit 1; fi
+        ONLY="$2"; shift 2 ;;
+      --only=*) ONLY="${1#--only=}"; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -v|--verbose) VERBOSE=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) log_error "Unknown option: $1 (see --help)"; exit 1 ;;
     esac
+  done
+}
+
+# True when section $1 should run (all when ONLY is empty).
+should_run() {
+  if [[ -z "${ONLY// /}" ]]; then
+    return 0
+  fi
+  local item
+  local IFS=','
+  read -ra _only_tokens <<< "$ONLY"
+  for item in "${_only_tokens[@]}"; do
+    if [[ "${item// /}" == "$1" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+validate_only() {
+  if [[ -z "${ONLY// /}" ]]; then
+    return 0
+  fi
+  local item
+  local IFS=','
+  read -ra _only_tokens <<< "$ONLY"
+  for item in "${_only_tokens[@]}"; do
+    item="${item// /}"
+    if [[ -z "$item" ]]; then
+      continue
+    fi
+    # shellcheck disable=SC2086
+    if [[ " $VALID_ONLY_TOKENS " != *" $item "* ]]; then
+      log_error "Unknown --only section: '$item'. Valid: $VALID_ONLY_TOKENS"
+      exit 1
+    fi
   done
 }
 
@@ -157,7 +245,8 @@ rpm_is_installed() { rpm -q "$1" &>/dev/null; }
 
 dnf_group_installed() {
   # Usage: dnf_group_installed "Development Tools" | "C Development"
-  sudo "$DNF_CMD" group list --installed 2>/dev/null | grep -qiF "$1"
+  # Anchored match so similarly-named groups can't false-positive.
+  sudo "$DNF_CMD" group list --installed 2>/dev/null | grep -qiE "^[[:space:]]*${1}[[:space:]]*$"
 }
 
 # Install only missing RPM packages. Usage: ensure_dnf_packages pkg1 pkg2 ...
@@ -229,8 +318,41 @@ confirm() {
     return 0
   fi
   local prompt="$1"
+  local ans
   read -r -p "$prompt [Y/n] " ans
   [[ -z "${ans:-}" || "$ans" =~ ^[Yy]$ ]]
+}
+
+# Keep a one-time baseline backup before editing user files.
+# The FIRST run's original is preserved; later runs never overwrite it.
+backup_file() {
+  local file="$1"
+  if [[ ! -f "$file" ]]; then
+    return 0
+  fi
+  local bak="${file}.pre-fedora-dev.bak"
+  if [[ -f "$bak" ]]; then
+    return 0
+  fi
+  cp -p "$file" "$bak" && log_info "Backed up ${file} → ${bak}"
+}
+
+# Download a URL to dest with retries. Skips existing non-empty files,
+# removes partial/empty output, and returns nonzero on failure WITHOUT
+# printing attacker-influenced content. Safe to use in `if` conditions.
+fetch_file() {
+  local url="$1" dest="$2"
+  if [[ -s "$dest" ]]; then
+    return 0
+  fi
+  local tmp="${dest}.part.$$"
+  rm -f "$tmp"
+  if curl -fsSL --retry 3 --max-time 120 -o "$tmp" "$url" 2>/dev/null && [[ -s "$tmp" ]]; then
+    mv "$tmp" "$dest"
+    return 0
+  fi
+  rm -f "$tmp" "$dest"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -248,7 +370,7 @@ preflight_privilege_check() {
   # Keep sudo timestamp alive in background; killed via trap on exit.
   ( while true; do sudo -n true 2>/dev/null || true; sleep 50; kill -0 $$ 2>/dev/null || exit 0; done ) &
   SUDO_KEEPALIVE_PID=$!
-  log_success " privilege check passed (sudo keep-alive PID ${SUDO_KEEPALIVE_PID})."
+  log_success "Privilege check passed (sudo keep-alive PID ${SUDO_KEEPALIVE_PID})."
 }
 
 preflight_os_check() {
@@ -321,7 +443,8 @@ preflight_disk_check() {
 preflight_snapshot() {
   section "Pre-flight: system snapshot (if available)"
   if command_exists snapper; then
-    if sudo snapper list-configs 2>/dev/null | grep -q .; then
+    # list-configs prints a header row; only data rows (NR>1) count as configs.
+    if sudo snapper list-configs 2>/dev/null | awk 'NR>1 && NF' | grep -q .; then
       log_info "Creating snapper pre-setup snapshot…"
       sudo snapper create --description "pre-fedora-dev-setup $(date '+%F %T')" --cleanup-algorithm number \
         && log_success "Snapper snapshot created." \
@@ -445,6 +568,21 @@ enable_flathub() {
     log_info "Adding Flathub remote…"
     flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
   fi
+  if [[ -n "${FLATPAK_APPS:-}" ]]; then
+    local app
+    # shellcheck disable=SC2086 # intentional word-splitting of ID list
+    for app in $FLATPAK_APPS; do
+      if flatpak list --app 2>/dev/null | grep -qF "$app"; then
+        log_info "Flatpak already installed: $app"
+      else
+        log_info "Installing flatpak: $app"
+        flatpak install -y --noninteractive flathub "$app" \
+          || log_warn "Flatpak install failed: $app"
+      fi
+    done
+  else
+    log_info "No FLATPAK_APPS requested; remote only (set FLATPAK_APPS=\"<id> …\" to install apps)."
+  fi
   log_success "Flathub ready."
 }
 
@@ -487,15 +625,13 @@ configure_kitty() {
     log_info "JetBrainsMono Nerd Font already installed."
   else
     log_info "Installing JetBrainsMono Nerd Font into ${font_dir}…"
-    local base="https://github.com/ryanoasis/nerd-fonts/raw/master/patched-fonts/JetBrainsMono"
+    local base="https://github.com/ryanoasis/nerd-fonts/raw/${NERD_FONTS_REF}/patched-fonts/JetBrainsMono"
     local spec dest ok=1
     for spec in "Regular:Regular" "Bold:Bold" "Italic:Italic" "BoldItalic:BoldItalic"; do
       local style="${spec%%:*}" dir="${spec##*:}"
       dest="$font_dir/JetBrainsMonoNerdFont-${style}.ttf"
-      if [[ ! -f "$dest" ]]; then
-        curl -fsSL -o "$dest" "$base/$dir/JetBrainsMonoNerdFont-${style}.ttf" 2>/dev/null \
-          || { log_warn "Font download failed: ${style}"; ok=0; }
-      fi
+      fetch_file "$base/$dir/JetBrainsMonoNerdFont-${style}.ttf" "$dest" \
+        || { log_warn "Font download failed: ${style}"; ok=0; }
     done
     fc-cache -f "$font_dir" &>/dev/null || true
     if fc-list 2>/dev/null | grep -qi "JetBrainsMono.*Nerd"; then
@@ -564,6 +700,7 @@ KITTY_EOF
   log_info "Kitty drop-in written: ${dropin}"
 
   # Wire the drop-in at the TOP of kitty.conf so user lines below still win.
+  backup_file "$kitty_dir/kitty.conf"
   touch "$kitty_dir/kitty.conf"
   if grep -qE '^[[:space:]]*include[[:space:]]+fedora-dev\.conf' "$kitty_dir/kitty.conf"; then
     log_info "kitty.conf already includes fedora-dev.conf."
@@ -621,7 +758,7 @@ install_zsh_p10k() {
     for f in "MesloLGS%20NF%20Regular.ttf" "MesloLGS%20NF%20Bold.ttf" \
              "MesloLGS%20NF%20Italic.ttf" "MesloLGS%20NF%20Bold%20Italic.ttf"; do
       local out="$font_dir/$(printf '%s' "$f" | sed 's/%20/ /g')"
-      [[ -f "$out" ]] || curl -fsSL -o "$out" "$base/$f" || log_warn "Font download failed: $f"
+      fetch_file "$base/$f" "$out" || log_warn "Font download failed: $f"
     done
     fc-cache -f "$font_dir" &>/dev/null || true
     fc-list 2>/dev/null | grep -qi "MesloLGS" \
@@ -636,7 +773,17 @@ install_zsh_p10k() {
     git -C "$omz_dir" pull --ff-only 2>/dev/null || log_warn "Oh My Zsh update failed; continuing."
   else
     log_info "Installing Oh My Zsh (unattended, keep-zshrc)…"
-    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended --keep-zshrc
+    local omz_installer
+    omz_installer="$(mktemp)"
+    # Never `sh -c "$(curl …)"`: an empty download would "succeed" silently.
+    if fetch_file "https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh" "$omz_installer"; then
+      sh "$omz_installer" "" --unattended --keep-zshrc \
+        || log_warn "Oh My Zsh installer failed; continuing without OMZ (re-run to retry)."
+      rm -f "$omz_installer"
+    else
+      rm -f "$omz_installer"
+      log_warn "Could not download the Oh My Zsh installer; continuing without OMZ (re-run to retry)."
+    fi
   fi
   local zsh_custom="${ZSH_CUSTOM:-$omz_dir/custom}"
   mkdir -p "$zsh_custom/themes" "$zsh_custom/plugins"
@@ -650,6 +797,7 @@ install_zsh_p10k() {
   git_clone_or_update "https://github.com/romkatv/powerlevel10k.git" "$zsh_custom/themes/powerlevel10k"
 
   # --- ~/.zshrc: create from OMZ template if missing, then enforce theme/plugins ---
+  backup_file "$HOME/.zshrc"
   touch "$HOME/.zshrc"
   if ! grep -q "oh-my-zsh" "$HOME/.zshrc" 2>/dev/null; then
     if [[ -f "$omz_dir/templates/zshrc.zsh-template" ]]; then
@@ -689,6 +837,9 @@ PREAMBLE_EOF
   # --- Default shell → zsh ---
   if [[ "${SHELL:-}" == *"zsh"* ]] || [[ "$(getent passwd "$USER" 2>/dev/null | cut -d: -f7 || echo "")" == *"zsh" ]]; then
     log_info "Default login shell is already zsh."
+  elif [[ "$NONINTERACTIVE" == "1" ]]; then
+    # chsh does its own PAM auth and may block without a TTY — never attempt it blind.
+    log_info "Skipping 'chsh' in non-interactive mode. Run manually: chsh -s \$(command -v zsh)"
   else
     log_info "Setting zsh as the default login shell…"
     if chsh -s "$(command -v zsh)" "$USER"; then
@@ -732,11 +883,18 @@ install_fnm_node() {
   log_info "Installing Node.js LTS (fnm install --lts)…"
   fnm install --lts
   # Pin LTS as default so new shells get it automatically.
-  local lts_ver
-  lts_ver="$(fnm ls 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1 || true)"
-  if [[ -n "${lts_ver:-}" ]]; then
-    fnm default "$lts_ver" 2>/dev/null || fnm alias default "$lts_ver" 2>/dev/null || true
-    log_success "Node.js LTS default set to ${lts_ver}."
+  if fnm default lts-latest 2>/dev/null; then
+    log_success "Node.js LTS set as default (lts-latest)."
+  else
+    # Fallback for older fnm releases: parse the newest installed version.
+    local lts_ver
+    lts_ver="$(fnm ls 2>/dev/null | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n1 || true)"
+    if [[ -n "${lts_ver:-}" ]]; then
+      fnm default "$lts_ver" 2>/dev/null || fnm alias default "$lts_ver" 2>/dev/null || true
+      log_success "Node.js LTS default set to ${lts_ver}."
+    else
+      log_warn "Could not pin a default Node version; run 'fnm default lts-latest' manually."
+    fi
   fi
   # pnpm + yarn via corepack (ships with Node ≥ 16.9). Idempotent.
   export PATH="$HOME/.local/share/fnm:$PATH"
@@ -791,7 +949,7 @@ install_rustup() {
     log_info "Installing rustup (default stable toolchain)…"
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile default
     # shellcheck disable=SC1090
-    [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env"
+    [[ -f "$HOME/.cargo/env" ]] && . "$HOME/.cargo/env" || true
   fi
   log_info "Ensuring Rust components: rust-analyzer, clippy, rustfmt…"
   rustup component add rust-analyzer clippy rustfmt 2>/dev/null || true
@@ -927,11 +1085,14 @@ fi
 # direnv hook (only if installed)
 command -v direnv >/dev/null 2>&1 && eval "$(direnv hook "${SHELL##*/}")" || true
 
-# Completions (guarded; never fail the shell startup)
-command -v gh >/dev/null 2>&1 && eval "$(gh completion -s "${SHELL##*/}" 2>/dev/null)" || true
-command -v rustup >/dev/null 2>&1 && eval "$(rustup completions "${SHELL##*/}" 2>/dev/null)" || true
-command -v uv >/dev/null 2>&1 && eval "$(uv generate-shell-completion "${SHELL##*/}" 2>/dev/null)" || true
-command -v fnm >/dev/null 2>&1 && eval "$(fnm completions --shell "${SHELL##*/}" 2>/dev/null)" || true
+# Completions: interactive shells only (keeps script/scp fast),
+# and FEDORA_DEV_NO_COMPLETIONS=1 disables them entirely.
+if [[ $- == *i* && -z "${FEDORA_DEV_NO_COMPLETIONS:-}" ]]; then
+  command -v gh >/dev/null 2>&1 && eval "$(gh completion -s "${SHELL##*/}" 2>/dev/null)" || true
+  command -v rustup >/dev/null 2>&1 && eval "$(rustup completions "${SHELL##*/}" 2>/dev/null)" || true
+  command -v uv >/dev/null 2>&1 && eval "$(uv generate-shell-completion "${SHELL##*/}" 2>/dev/null)" || true
+  command -v fnm >/dev/null 2>&1 && eval "$(fnm completions --shell "${SHELL##*/}" 2>/dev/null)" || true
+fi
 BLOCK_EOF
 }
 
@@ -939,6 +1100,8 @@ configure_shells() {
   section "Shell & PATH configuration (~/.bashrc, ~/.zshrc)"
   local block
   block="$(build_shell_block)"
+  backup_file "$HOME/.bashrc"
+  backup_file "$HOME/.zshrc"
   ensure_managed_block "$HOME/.bashrc" "$block"
   log_info "~/.bashrc wired (managed block upserted)."
   # zsh is a hard requirement now (OMZ + p10k installer above guarantees it).
@@ -1049,19 +1212,19 @@ print_summary() {
   │ Build              │ @development-tools, @c-development, cmake,   │
   │                    │ ninja, clang, lld, gdb, valgrind, *-devel    │
   │ CLI toolkit        │ git, gh, rg, fd, fzf, bat, eza, jq, htop,    │
-  │                    │ btop, tmux, zsh, stow, direnv, nvim, kitty  │
-  │ Node               │ fnm (user-space) + Node LTS + pnpm + yarn   │
-  │ Python             │ uv + pyenv + pyenv-virtualenv (user-space)  │
-  │ Rust               │ rustup stable + rust-analyzer/clippy/fmt    │
-  │ Go                 │ golang + ~/go (GOPATH/GOBIN wired)          │
-  │ Java               │ java-21-openjdk-devel (+ SDKMAN! if asked)  │
-  │ Containers         │ podman stack (+ Docker CE if --docker)      │
-  │ Virtualization     │ qemu-kvm, libvirt, virt-manager, libvirtd  │
-  │ Zsh                │ Oh My Zsh + Powerlevel10k, dev plugins,     │
-  │                    │ Meslo Nerd Font, zsh default shell         │
-  │ Kitty              │ Catppuccin Mocha, JetBrainsMono Nerd 13,   │
-  │                    │ drop-in conf, GNOME default terminal       │
-  │ Shell              │ Managed PATH block in ~/.bashrc + ~/.zshrc  │
+  │                    │ btop, tmux, zsh, stow, direnv, nvim, kitty   │
+  │ Node               │ fnm (user-space) + Node LTS + pnpm + yarn    │
+  │ Python             │ uv + pyenv + pyenv-virtualenv (user-space)   │
+  │ Rust               │ rustup stable + rust-analyzer/clippy/fmt     │
+  │ Go                 │ golang + ~/go (GOPATH/GOBIN wired)           │
+  │ Java               │ java-21-openjdk-devel (+ SDKMAN! if asked)   │
+  │ Containers         │ podman stack (+ Docker CE if --docker)       │
+  │ Virtualization     │ qemu-kvm, libvirt, virt-manager, libvirtd    │
+  │ Zsh                │ Oh My Zsh + Powerlevel10k, dev plugins,      │
+  │                    │ Meslo Nerd Font, zsh default shell           │
+  │ Kitty              │ Catppuccin Mocha, JetBrainsMono Nerd 13,     │
+  │                    │ drop-in conf, GNOME default terminal         │
+  │ Shell              │ Managed PATH block in ~/.bashrc + ~/.zshrc   │
   └────────────────────┴──────────────────────────────────────────────┘
 EOF
   echo ""
@@ -1083,7 +1246,8 @@ EOF
   echo "       ./$SCRIPT_NAME"
   echo "     Your ~/.p10k.zsh is never overwritten on re-runs."
   echo "     Add Docker/SDKMAN later with: ./$SCRIPT_NAME --docker --sdkman"
-  echo "  5. Full log saved to: $LOG_FILE"
+  echo "     Original dotfiles are kept as *.pre-fedora-dev.bak (first run only)."
+  echo "  6. Full log (appended every run) saved to: $LOG_FILE"
   if [[ -n "${VERIFY_REPORT_FILE:-}" ]]; then
     echo "     Verification snapshot: $VERIFY_REPORT_FILE"
   fi
@@ -1093,35 +1257,91 @@ EOF
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+log_run_header() {
+  # Append (never truncate): keep history across re-runs.
+  {
+    printf '\n================================================================\n'
+    printf 'Run started: %s | args: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+    printf 'Flags: docker=%s sdkman=%s skip_upgrade=%s only=%s dry_run=%s dnf=%s\n' \
+      "$INSTALL_DOCKER" "$INSTALL_SDKMAN" "$SKIP_UPGRADE" "${ONLY:-all}" "$DRY_RUN" "$DNF_CMD"
+  } >>"$LOG_FILE" 2>/dev/null || true
+}
+
+dry_run_plan() {
+  log_info "DRY RUN — no changes will be made (sudo prompt and snapshot skipped)."
+  preflight_os_check
+  preflight_network_check
+  preflight_disk_check
+  section "Dry-run plan"
+  local entry token desc
+  for entry in "${_STEPS[@]}"; do
+    token="${entry%%:*}"
+    desc="${entry#*:}"
+    if should_run "$token"; then
+      if [[ "$token" == "upgrade" && "$SKIP_UPGRADE" == "1" ]]; then
+        log_info "[skip] ${desc} (--skip-upgrade)"
+      else
+        log_info "[run]  ${desc}"
+      fi
+    else
+      log_info "[skip] ${desc} (--only filter)"
+    fi
+  done
+  log_info "Options: docker=${INSTALL_DOCKER} sdkman=${INSTALL_SDKMAN} flatpak_apps='${FLATPAK_APPS:-none}'"
+  log_info "Pre-flight, verification and summary always run in a real execution."
+}
+
 main() {
   parse_args "$@"
-  : >"$LOG_FILE" 2>/dev/null || true
+  if [[ "$VERBOSE" == "1" ]]; then
+    set -x
+  fi
+  validate_only
+  log_run_header "$@"
   log_info "Starting ${SCRIPT_NAME} (docker=${INSTALL_DOCKER}, sdkman=${INSTALL_SDKMAN}, dnf=${DNF_CMD}). Log: ${LOG_FILE}"
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    dry_run_plan
+    exit 0
+  fi
 
   run_preflight
 
-  tune_dnf
-  system_upgrade
-  enable_rpmfusion
-  enable_openh264
-  enable_flathub
+  if ! confirm "Proceed with setup (system upgrade + dev environment)?"; then
+    log_info "Aborted by user."
+    exit 0
+  fi
 
-  install_build_essentials
-  install_cli_toolkit
-  install_editors_terminals
-  configure_kitty
-  install_zsh_p10k
+  if should_run tune; then tune_dnf; fi
+  if should_run upgrade; then
+    if [[ "$SKIP_UPGRADE" == "1" ]]; then
+      log_info "Skipping system upgrade (--skip-upgrade)."
+    else
+      system_upgrade
+    fi
+  fi
+  if should_run repos; then
+    enable_rpmfusion
+    enable_openh264
+    enable_flathub
+  fi
 
-  install_fnm_node
-  install_uv_pyenv
-  install_rustup
-  install_go
-  install_java
+  if should_run build; then install_build_essentials; fi
+  if should_run cli; then install_cli_toolkit; fi
+  if should_run editors; then install_editors_terminals; fi
+  if should_run kitty; then configure_kitty; fi
+  if should_run zsh; then install_zsh_p10k; fi
 
-  install_containers
-  install_virtualization
+  if should_run node; then install_fnm_node; fi
+  if should_run python; then install_uv_pyenv; fi
+  if should_run rust; then install_rustup; fi
+  if should_run go; then install_go; fi
+  if should_run java; then install_java; fi
 
-  configure_shells
+  if should_run containers; then install_containers; fi
+  if should_run virt; then install_virtualization; fi
+
+  if should_run shells; then configure_shells; fi
   run_verification
   print_summary
 

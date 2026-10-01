@@ -1,6 +1,51 @@
-# System Backup & Restore Script
+# Fedora Dev Machine Toolkit
 
-A Bash script that captures the full software configuration and user environment of a **Fedora Linux** system into a timestamped backup directory, and generates a self-contained restore script for rebuilding the same environment on a new machine.
+Two complementary Bash scripts for Fedora Linux: one builds a fresh Fedora Workstation into a polyglot dev environment, the other backs that machine up and restores it elsewhere.
+
+| Script | Purpose | Docs |
+|---|---|---|
+| `setup-fedora-dev.sh` | Fresh install → dev environment (repos, toolchains, zsh + p10k, kitty, containers). Idempotent | [`FEDORA-DEV-SETUP.md`](FEDORA-DEV-SETUP.md) |
+| `backup-system.sh` | Running machine → timestamped backup + generated `restore-system.sh` | This README (below) |
+
+Typical lifecycle: **set up** a new machine → **back it up** → **restore** on the next machine → **re-run setup** to converge.
+
+## Quickstart
+
+```bash
+# 1. Build the environment (fresh Fedora Workstation, ~15-30 min)
+chmod +x setup-fedora-dev.sh
+./setup-fedora-dev.sh --dry-run   # preview, changes nothing
+./setup-fedora-dev.sh
+# then: log out/in, open kitty, run `p10k configure` if prompted
+
+# 2. Back it up
+./backup-system.sh                    # → ~/system-backup-YYYYMMDD-HHMMSS/
+./backup-system.sh /path/to/backup    # → custom root
+
+# 3. Restore on another machine
+tar -xzf system-backup-YYYYMMDD-HHMMSS.tar.gz
+cd system-backup-YYYYMMDD-HHMMSS
+bash restore-system.sh
+```
+
+## Setup script at a glance
+
+`setup-fedora-dev.sh` is fully automated and idempotent (safe to re-run; only gaps are filled):
+
+- Pre-flight (Fedora check, network, ≥ 20 GB disk, sudo once, snapper/timeshift snapshot) with exit codes `0/1/2`
+- DNF tuning, full upgrade, RPM Fusion, OpenH264, Flathub
+- Build tools, modern CLI set, neovim, kitty (Catppuccin Mocha, JetBrainsMono Nerd 13)
+- User-space runtimes: fnm + Node LTS, uv + pyenv, rustup, Go, OpenJDK (optional SDKMAN!, Docker CE)
+- Podman stack, KVM/libvirt, Oh My Zsh + Powerlevel10k with zsh as default shell
+- Flags: `--docker --sdkman --skip-upgrade --only <sections> --dry-run -y -v` (all with env equivalents)
+
+See [`FEDORA-DEV-SETUP.md`](FEDORA-DEV-SETUP.md) for the full flag reference, `--only` tokens, post-install checklist, and troubleshooting.
+
+---
+
+# System Backup & Restore
+
+`backup-system.sh` captures the full software configuration and user environment into a timestamped backup directory, then generates a self-contained `restore-system.sh` for rebuilding the same environment on a new machine.
 
 ## Overview
 
@@ -60,11 +105,17 @@ The following are **not** automatically backed up. You must handle these separat
 
 ## Prerequisites
 
+### Backup script
+
 - **OS:** Fedora Linux (tested on recent Fedora releases)
 - **Shell:** Bash 4+
 - **Required tools:** `bash`, `rpm`, `dnf`, `flatpak`, `pip`, `npm`
 - **Optional tools:** `go`, `nvm` (script gracefully skips if absent)
 - **Permissions:** Run normally for most items. `sudo` is used inside `restore-system.sh` for package installation.
+
+### Setup script
+
+- Fedora Workstation, a regular user with `sudo` rights (never root), internet, ≥ 20 GB free disk. Details in [`FEDORA-DEV-SETUP.md`](FEDORA-DEV-SETUP.md).
 
 ## Usage
 
@@ -94,6 +145,8 @@ bash restore-system.sh
 ```
 
 Or simply copy the backup directory and run `restore-system.sh` from within it.
+
+> Tip: after restoring, re-run `./setup-fedora-dev.sh` to converge anything the backup doesn't cover (fresh toolchains, shell wiring, verification).
 
 ## After Restore — Mandatory Steps
 
@@ -164,7 +217,7 @@ system-backup-YYYYMMDD-HHMMSS/
 
 ## Customization
 
-The script is designed to be easily modified. Key areas to customize:
+The backup script is designed to be easily modified. Key areas to customize:
 
 - **Additional dotfiles:** Add filenames to the loop in section 5 (line ~64)
 - **Additional directories to back up:** Add `cp -r` commands in section 6
