@@ -45,7 +45,7 @@ Every flag has an env-var equivalent. CLI flags win by assignment order (last on
 | `tune` | DNF tuning (`max_parallel_downloads=10`, `fastestmirror=True`) |
 | `upgrade` | Full `dnf upgrade --refresh` (honors `--skip-upgrade`) |
 | `repos` | RPM Fusion Free/Non-Free, Cisco OpenH264, Flathub (+ `FLATPAK_APPS`) |
-| `build` | `@development-tools`, `@c-development`, cmake/ninja/clang/lld/gdb/valgrind, `*-devel` libs |
+| `build` | Development Tools + C Development groups (name → id → explicit-package fallback, so comps can never abort the run), cmake/ninja/clang/lld/gdb/valgrind, `*-devel` libs |
 | `cli` | git, gh, ripgrep, fd, fzf, bat, eza, jq, htop, btop, tmux, zsh, stow, direnv, unzip, curl, wget |
 | `editors` | neovim, kitty packages |
 | `kitty` | JetBrainsMono Nerd Font, Catppuccin Mocha drop-in (`~/.config/kitty/fedora-dev.conf`), GNOME default terminal |
@@ -126,7 +126,8 @@ Exit codes: `0` success · `1` pre-flight/argument failure · `2` run-as-root/su
 | `Insufficient disk space` (exit 1) | Free space or lower `MIN_DISK_GB=<n>` |
 | `Unknown --only section` (exit 1) | Typo — valid tokens listed in the error |
 | Font download warnings | Transient/upstream layout change — re-run; kitty falls back to monospace meanwhile; pin with `NERD_FONTS_REF=<tag>` |
-| Oh My Zsh reported MISSING | Network blip during install — re-run (or `--only zsh`) |
+| Oh My Zsh / pyenv / plugins reported MISSING after an interrupted run | Stale non-git leftovers are moved aside to `<dir>.stale-<timestamp>` (never deleted) and cloned fresh — inspect, then re-run (or `--only zsh` / `--only python`) |
+| Power cut mid-run | Dotfile writes are atomic renames, so configs can't truncate — re-run the full script and follow the verification table; `*.pre-fedora-dev.bak` files restore shell/kitty configs |
 | `id -nG` / `$SHELL` unchanged | Group/shell changes need logout + login |
 | `p10k configure` never ran | `-y`/no-TTY run — launch it manually in kitty |
 | Slow re-runs | `--skip-upgrade`, or `--only` the section you're iterating on |

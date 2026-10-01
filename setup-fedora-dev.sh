@@ -244,9 +244,14 @@ command_exists() { command -v "$1" &>/dev/null; }
 rpm_is_installed() { rpm -q "$1" &>/dev/null; }
 
 dnf_group_installed() {
-  # Usage: dnf_group_installed "Development Tools" | "C Development"
+  # Usage: dnf_group_installed "Development Tools" (display name or group id).
   # Anchored match so similarly-named groups can't false-positive.
   sudo "$DNF_CMD" group list --installed 2>/dev/null | grep -qiE "^[[:space:]]*${1}[[:space:]]*$"
+}
+
+# True when dnf can resolve a group spec (display name or id) right now.
+dnf_group_available() {
+  sudo "$DNF_CMD" group info "$1" &>/dev/null
 }
 
 # Install only missing RPM packages. Usage: ensure_dnf_packages pkg1 pkg2 ...
@@ -269,14 +274,30 @@ ensure_dnf_packages() {
   sudo "$DNF_CMD" install -y "${missing[@]}"
 }
 
+# Install a comps group with a safe fallback chain, so one unresolvable spec
+# (e.g. dnf5 preferring group IDs over display names) can't abort the run.
+# Usage: ensure_dnf_group "Display Name" "group-id" fallback-pkg1 ...
 ensure_dnf_group() {
-  local group="$1"
-  if dnf_group_installed "$group"; then
-    log_info "DNF group already installed: '${group}'"
-  else
-    log_info "Installing DNF group: '${group}'"
-    sudo "$DNF_CMD" group install -y "$group"
+  local name="$1" gid="$2"
+  shift 2
+  if dnf_group_installed "$name" || dnf_group_installed "$gid"; then
+    log_info "DNF group already installed: '${name}'"
+    return 0
   fi
+  local spec
+  for spec in "$name" "$gid"; do
+    if ! dnf_group_available "$spec"; then
+      log_info "DNF group spec not resolvable, skipping: '${spec}'"
+      continue
+    fi
+    log_info "Installing DNF group: '${spec}'"
+    if sudo "$DNF_CMD" group install -y "$spec"; then
+      return 0
+    fi
+    log_warn "Group install failed for '${spec}'; trying next option."
+  done
+  log_warn "Group '${name}' unavailable from comps; falling back to explicit packages: $*"
+  ensure_dnf_packages "$@"
 }
 
 # Append an exact line to a file only if it is not already present.
@@ -292,24 +313,56 @@ ensure_line_in_file() {
 
 # Ensure a managed block exists between markers in a shell rc file.
 # Re-running replaces the block instead of duplicating it.
+# The final write is an atomic rename, so a power cut can't truncate the file.
 ensure_managed_block() {
   local file="$1" block_content="$2"
   local begin="# >>> fedora-dev-setup >>>"
   local end="# <<< fedora-dev-setup <<<"
   touch "$file"
-  local tmp
-  tmp="$(mktemp)"
+  local work
+  work="$(mktemp "$(dirname "$file")/.fedora-dev.XXXXXX")"
   # Remove any previous managed block, keep everything else byte-identical.
   awk -v b="$begin" -v e="$end" '
     $0 == b { skip=1; next }
     $0 == e { skip=0; next }
     !skip { print }
-  ' "$file" >"$tmp"
+  ' "$file" >"$work"
   {
-    cat "$tmp"
+    cat "$work"
     printf '%s\n' "$begin" "$block_content" "$end"
-  } >"$file"
-  rm -f "$tmp"
+  } | atomic_write "$file"
+  rm -f "$work"
+}
+
+# Atomic stdin → file writer (temp in the same directory + rename).
+# Usage: something_generating_text | atomic_write /path/to/file
+atomic_write() {
+  local dest="$1" tmp rc
+  tmp="$(mktemp "$(dirname "$dest")/.fedora-dev.XXXXXX")" || return 1
+  if cat >"$tmp"; then
+    mv -f "$tmp" "$dest"
+  else
+    rc=$?
+    rm -f "$tmp"
+    return "$rc"
+  fi
+}
+
+# Clear a non-git directory left behind by an interrupted run by moving it
+# aside (recoverable, never deleted). Returns 0 when dest is absent
+# afterwards (fresh work may proceed), 1 when something remains.
+clear_stale_dir() {
+  local dest="$1"
+  if [[ -d "$dest/.git" ]] || [[ ! -e "$dest" ]]; then
+    return 0
+  fi
+  if [[ -z "$(ls -A "$dest" 2>/dev/null)" ]]; then
+    log_info "Removing empty stale directory ${dest}…"
+    rmdir "$dest" 2>/dev/null && return 0 || return 1
+  fi
+  local aside="${dest}.stale-$(date +%Y%m%d-%H%M%S)"
+  log_warn "${dest} is not a git checkout (possibly an interrupted run); moving aside to ${aside}."
+  mv "$dest" "$aside"
 }
 
 confirm() {
@@ -345,6 +398,8 @@ fetch_file() {
   if [[ -s "$dest" ]]; then
     return 0
   fi
+  # Drop leftovers from runs killed mid-download (ours use .part.<pid> names).
+  rm -f "${dest}.part".* 2>/dev/null || true
   local tmp="${dest}.part.$$"
   rm -f "$tmp"
   if curl -fsSL --retry 3 --max-time 120 -o "$tmp" "$url" 2>/dev/null && [[ -s "$tmp" ]]; then
@@ -591,8 +646,12 @@ enable_flathub() {
 # ---------------------------------------------------------------------------
 install_build_essentials() {
   section "Build essentials"
-  ensure_dnf_group "Development Tools"
-  ensure_dnf_group "C Development"
+  # Group display names differ in strictness between dnf4/dnf5; each call
+  # tries name → id → explicit packages, so comps can never abort the run.
+  ensure_dnf_group "Development Tools" "development-tools" \
+    gcc gcc-c++ make automake autoconf libtool binutils bison flex pkgconf
+  ensure_dnf_group "C Development Tools and Libraries" "c-development" \
+    glibc-devel kernel-headers elfutils-libelf-devel
   ensure_dnf_packages \
     cmake ninja-build clang lld gdb valgrind pkg-config \
     openssl-devel libffi-devel zlib-devel readline-devel sqlite-devel
@@ -647,7 +706,11 @@ configure_kitty() {
   local kitty_dir="$HOME/.config/kitty"
   local dropin="$kitty_dir/fedora-dev.conf"
   mkdir -p "$kitty_dir"
-  cat >"$dropin" <<'KITTY_EOF'
+  # Written to a same-directory temp file + renamed, so interruption can't
+  # leave a truncated drop-in behind.
+  local tmp_dropin
+  tmp_dropin="$(mktemp "$kitty_dir/.fedora-dev.XXXXXX")"
+  cat >"$tmp_dropin" <<'KITTY_EOF'
 # Managed by setup-fedora-dev.sh (idempotent; safe to tweak, re-runs overwrite this file only).
 # Theme: Catppuccin Mocha | Font: JetBrainsMono Nerd Font 13.
 
@@ -697,6 +760,7 @@ window_padding_width  8
 enable_audio_bell     no
 confirm_os_window_close 0
 KITTY_EOF
+  mv -f "$tmp_dropin" "$dropin"
   log_info "Kitty drop-in written: ${dropin}"
 
   # Wire the drop-in at the TOP of kitty.conf so user lines below still win.
@@ -706,11 +770,10 @@ KITTY_EOF
     log_info "kitty.conf already includes fedora-dev.conf."
   else
     local tmp_k
-    tmp_k="$(mktemp)"
+    tmp_k="$(mktemp "$kitty_dir/.fedora-dev.XXXXXX")"
     printf 'include fedora-dev.conf\n' >"$tmp_k"
     cat "$kitty_dir/kitty.conf" >>"$tmp_k"
-    cat "$tmp_k" >"$kitty_dir/kitty.conf"
-    rm -f "$tmp_k"
+    mv -f "$tmp_k" "$kitty_dir/kitty.conf"
     log_info "kitty.conf now includes fedora-dev.conf (first line)."
   fi
 
@@ -728,16 +791,24 @@ KITTY_EOF
 }
 
 # Idempotent git clone-or-update helper for user-space repos.
+# A leftover non-git directory (e.g. from a killed run) is moved aside so a
+# fresh clone can proceed; genuine checkouts are fast-forwarded in place.
 git_clone_or_update() {
   local url="$1" dest="$2"
   if [[ -d "$dest/.git" ]]; then
     log_info "Updating $(basename "$dest")…"
     git -C "$dest" pull --ff-only 2>/dev/null || log_warn "Update failed for ${dest}; continuing with existing checkout."
-  elif [[ -d "$dest" ]]; then
-    log_warn "${dest} exists but is not a git repo; leaving untouched."
-  else
+    return 0
+  fi
+  if ! clear_stale_dir "$dest"; then
+    log_warn "Cannot clear ${dest}; leaving untouched (re-run after inspecting it)."
+    return 0
+  fi
+  if [[ ! -e "$dest" ]]; then
     log_info "Cloning $(basename "$dest")…"
-    git clone --depth=1 "$url" "$dest"
+    mkdir -p "$(dirname "$dest")"
+    git clone --depth=1 "$url" "$dest" \
+      || log_warn "Clone failed for ${dest}; re-run to retry."
   fi
 }
 
@@ -768,10 +839,13 @@ install_zsh_p10k() {
 
   # --- Oh My Zsh (unattended, keep existing .zshrc) ---
   local omz_dir="$HOME/.oh-my-zsh"
-  if [[ -d "$omz_dir" ]]; then
+  if [[ -d "$omz_dir/.git" ]]; then
     log_info "Oh My Zsh already installed; updating…"
     git -C "$omz_dir" pull --ff-only 2>/dev/null || log_warn "Oh My Zsh update failed; continuing."
   else
+    if ! clear_stale_dir "$omz_dir"; then
+      log_warn "Cannot clear ${omz_dir}; skipping OMZ setup (inspect and re-run)."
+    else
     log_info "Installing Oh My Zsh (unattended, keep-zshrc)…"
     local omz_installer
     omz_installer="$(mktemp)"
@@ -783,6 +857,7 @@ install_zsh_p10k() {
     else
       rm -f "$omz_installer"
       log_warn "Could not download the Oh My Zsh installer; continuing without OMZ (re-run to retry)."
+    fi
     fi
   fi
   local zsh_custom="${ZSH_CUSTOM:-$omz_dir/custom}"
@@ -802,7 +877,10 @@ install_zsh_p10k() {
   if ! grep -q "oh-my-zsh" "$HOME/.zshrc" 2>/dev/null; then
     if [[ -f "$omz_dir/templates/zshrc.zsh-template" ]]; then
       log_info "Seeding ~/.zshrc from Oh My Zsh template…"
-      cp "$omz_dir/templates/zshrc.zsh-template" "$HOME/.zshrc"
+      local tmp_seed
+      tmp_seed="$(mktemp "$HOME/.fedora-dev.XXXXXX")"
+      cp "$omz_dir/templates/zshrc.zsh-template" "$tmp_seed" \
+        && mv -f "$tmp_seed" "$HOME/.zshrc" || rm -f "$tmp_seed"
     fi
   fi
   if grep -qE '^ZSH_THEME=' "$HOME/.zshrc"; then
@@ -819,7 +897,7 @@ install_zsh_p10k() {
   # p10k instant-prompt preamble belongs at the very top of .zshrc.
   if ! grep -q "p10k-instant-prompt" "$HOME/.zshrc"; then
     local tmp_zsh
-    tmp_zsh="$(mktemp)"
+    tmp_zsh="$(mktemp "$HOME/.fedora-dev.XXXXXX")"
     cat >"$tmp_zsh" <<'PREAMBLE_EOF'
 # Enable Powerlevel10k instant prompt (keep near the top of ~/.zshrc).
 if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
@@ -827,8 +905,7 @@ if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]
 fi
 PREAMBLE_EOF
     cat "$HOME/.zshrc" >>"$tmp_zsh"
-    cat "$tmp_zsh" >"$HOME/.zshrc"
-    rm -f "$tmp_zsh"
+    mv -f "$tmp_zsh" "$HOME/.zshrc"
   fi
   # Load existing (or future, post-wizard) p10k config.
   ensure_line_in_file '[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh' "$HOME/.zshrc"
@@ -921,21 +998,9 @@ install_uv_pyenv() {
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
   fi
   local pyenv_root="$HOME/.pyenv"
-  if [[ -d "$pyenv_root/.git" ]]; then
-    log_info "pyenv already cloned; updating…"
-    git -C "$pyenv_root" pull --ff-only 2>/dev/null || log_warn "pyenv update failed; continuing with existing checkout."
-  elif [[ -d "$pyenv_root" ]]; then
-    log_info "pyenv directory already exists at ${pyenv_root}."
-  else
-    log_info "Cloning pyenv into ~/.pyenv…"
-    git clone https://github.com/pyenv/pyenv.git "$pyenv_root"
-  fi
+  git_clone_or_update "https://github.com/pyenv/pyenv.git" "$pyenv_root"
   # pyenv-virtualenv plugin (idempotent).
-  if [[ -d "$pyenv_root/plugins/pyenv-virtualenv/.git" ]]; then
-    git -C "$pyenv_root/plugins/pyenv-virtualenv" pull --ff-only 2>/dev/null || true
-  elif [[ ! -d "$pyenv_root/plugins/pyenv-virtualenv" ]]; then
-    git clone https://github.com/pyenv/pyenv-virtualenv.git "$pyenv_root/plugins/pyenv-virtualenv" || true
-  fi
+  git_clone_or_update "https://github.com/pyenv/pyenv-virtualenv.git" "$pyenv_root/plugins/pyenv-virtualenv"
   log_success "uv + pyenv ready."
 }
 
