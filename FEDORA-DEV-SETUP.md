@@ -36,19 +36,25 @@ Env-var equivalents: `INSTALL_DOCKER=1`, `INSTALL_SDKMAN=1`, `NONINTERACTIVE=1`.
 ```
 
 1. Enter your `sudo` password once when prompted (kept alive in background).
-2. Wait through: pre-flight checks → DNF tuning → full `upgrade --refresh` → RPM Fusion + OpenH264 + Flathub → build tools / CLI / nvim + kitty → fnm+Node LTS, uv+pyenv, rustup, Go, JDK → podman (+ Docker if flagged) + libvirt → shell wiring → verification table.
-3. The script is idempotent — re-running only fills gaps.
+2. Wait through: pre-flight checks → DNF tuning → full `upgrade --refresh` → RPM Fusion + OpenH264 + Flathub → build tools / CLI / nvim + kitty (Catppuccin Mocha drop-in, JetBrainsMono Nerd 13, GNOME default) → zsh + Oh My Zsh + Powerlevel10k (dev plugins, Meslo font, `chsh` to zsh) → fnm+Node LTS, uv+pyenv, rustup, Go, JDK → podman (+ Docker if flagged) + libvirt → shell wiring → verification table.
+3. The `p10k configure` wizard launches interactively (skipped with `-y` or no TTY — run `p10k configure` manually later). Your existing `~/.p10k.zsh` is never overwritten.
+4. The script is idempotent — re-running only fills gaps.
 
 ## 5. Mandatory post-install steps
 
 ```bash
-# 1. Log out and back in (activates docker/libvirt group membership)
+# 1. Log out and back in (activates docker/libvirt groups AND the new zsh default shell)
 id -nG   # should eventually show docker and/or libvirt
+echo $SHELL  # should end in /zsh
 
-# 2. Reload shell config (or open a new terminal)
-source ~/.bashrc  # or: source ~/.zshrc
+# 2. Open kitty (now the default terminal, Catppuccin Mocha, JetBrainsMono NF 13),
+#    then configure the prompt if the wizard didn't run during setup
+p10k configure   # only if the wizard didn't run during setup
 
-# 3. Confirm runtimes
+# 3. Reload shell config (or open a new terminal)
+source ~/.zshrc
+
+# 4. Confirm runtimes
 node --version && pnpm --version && yarn --version
 uv --version && pyenv --versions
 rustc --version && cargo --version

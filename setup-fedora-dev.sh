@@ -15,7 +15,9 @@
 #   5. Installs polyglot runtimes in user space (fnm/node, uv/pyenv,
 #      rustup, go, JDK/sdkman)
 #   6. Installs podman stack, optional Docker CE, KVM/libvirt stack
-#   7. Idempotent shell PATH + completion wiring for ~/.bashrc & ~/.zshrc
+#   7. Zsh + Oh My Zsh + Powerlevel10k (dev plugins, zsh default shell,
+#      interactive `p10k configure`) + idempotent PATH/completion wiring
+#      for ~/.bashrc & ~/.zshrc
 #   8. Verification + post-install report
 #
 # USAGE:
@@ -474,6 +476,240 @@ install_editors_terminals() {
   log_success "neovim + kitty installed."
 }
 
+configure_kitty() {
+  section "Kitty terminal (Catppuccin Mocha, JetBrainsMono Nerd 13)"
+  command_exists kitty || ensure_dnf_packages kitty
+
+  # --- JetBrainsMono Nerd Font, user-space (kitty + editor/prompt glyphs) ---
+  local font_dir="$HOME/.local/share/fonts"
+  mkdir -p "$font_dir"
+  if fc-list 2>/dev/null | grep -qi "JetBrainsMono.*Nerd"; then
+    log_info "JetBrainsMono Nerd Font already installed."
+  else
+    log_info "Installing JetBrainsMono Nerd Font into ${font_dir}…"
+    local base="https://github.com/ryanoasis/nerd-fonts/raw/master/patched-fonts/JetBrainsMono"
+    local spec dest ok=1
+    for spec in "Regular:Regular" "Bold:Bold" "Italic:Italic" "BoldItalic:BoldItalic"; do
+      local style="${spec%%:*}" dir="${spec##*:}"
+      dest="$font_dir/JetBrainsMonoNerdFont-${style}.ttf"
+      if [[ ! -f "$dest" ]]; then
+        curl -fsSL -o "$dest" "$base/$dir/JetBrainsMonoNerdFont-${style}.ttf" 2>/dev/null \
+          || { log_warn "Font download failed: ${style}"; ok=0; }
+      fi
+    done
+    fc-cache -f "$font_dir" &>/dev/null || true
+    if fc-list 2>/dev/null | grep -qi "JetBrainsMono.*Nerd"; then
+      log_success "JetBrainsMono Nerd Font installed."
+    elif [[ "$ok" == "1" ]]; then
+      log_success "JetBrainsMono Nerd Font downloaded (fontconfig will pick it up on next login)."
+    else
+      log_warn "JetBrainsMono Nerd Font incomplete; kitty falls back to monospace. Re-run to retry."
+    fi
+  fi
+
+  # --- Drop-in config (re-runs overwrite this file only; kitty.conf preserved) ---
+  local kitty_dir="$HOME/.config/kitty"
+  local dropin="$kitty_dir/fedora-dev.conf"
+  mkdir -p "$kitty_dir"
+  cat >"$dropin" <<'KITTY_EOF'
+# Managed by setup-fedora-dev.sh (idempotent; safe to tweak, re-runs overwrite this file only).
+# Theme: Catppuccin Mocha | Font: JetBrainsMono Nerd Font 13.
+
+font_family      JetBrainsMono Nerd Font
+bold_font        auto
+italic_font      auto
+bold_italic_font auto
+font_size        13.0
+
+shell zsh
+
+foreground           #cdd6f4
+background           #1e1e2e
+selection_foreground #cdd6f4
+selection_background #45475a
+cursor               #f5e0dc
+cursor_text_color    #1e1e2e
+url_color            #89dceb
+
+active_tab_foreground   #11111b
+active_tab_background   #cba6f7
+inactive_tab_foreground #cdd6f4
+inactive_tab_background #181825
+tab_bar_background      #11111b
+tab_bar_style           powerline
+tab_powerline_style     slanted
+
+color0  #45475a
+color8  #585b70
+color1  #f38ba8
+color9  #f38ba8
+color2  #a6e3a1
+color10 #a6e3a1
+color3  #f9e2af
+color11 #f9e2af
+color4  #89b4fa
+color12 #89b4fa
+color5  #f5c2e7
+color13 #f5c2e7
+color6  #94e2d5
+color14 #94e2d5
+color7  #bac2de
+color15 #a6adc8
+
+scrollback_lines      10000
+window_padding_width  8
+enable_audio_bell     no
+confirm_os_window_close 0
+KITTY_EOF
+  log_info "Kitty drop-in written: ${dropin}"
+
+  # Wire the drop-in at the TOP of kitty.conf so user lines below still win.
+  touch "$kitty_dir/kitty.conf"
+  if grep -qE '^[[:space:]]*include[[:space:]]+fedora-dev\.conf' "$kitty_dir/kitty.conf"; then
+    log_info "kitty.conf already includes fedora-dev.conf."
+  else
+    local tmp_k
+    tmp_k="$(mktemp)"
+    printf 'include fedora-dev.conf\n' >"$tmp_k"
+    cat "$kitty_dir/kitty.conf" >>"$tmp_k"
+    cat "$tmp_k" >"$kitty_dir/kitty.conf"
+    rm -f "$tmp_k"
+    log_info "kitty.conf now includes fedora-dev.conf (first line)."
+  fi
+
+  # --- GNOME default terminal → kitty ---
+  if command_exists gsettings; then
+    if gsettings set org.gnome.desktop.default-applications.terminal exec 'kitty' 2>/dev/null; then
+      log_success "kitty set as GNOME default terminal."
+    else
+      log_warn "Could not set GNOME default terminal (schema missing?). Set it manually in Settings."
+    fi
+  else
+    log_info "gsettings not found; skipping default-terminal switch."
+  fi
+  log_success "Kitty setup complete."
+}
+
+# Idempotent git clone-or-update helper for user-space repos.
+git_clone_or_update() {
+  local url="$1" dest="$2"
+  if [[ -d "$dest/.git" ]]; then
+    log_info "Updating $(basename "$dest")…"
+    git -C "$dest" pull --ff-only 2>/dev/null || log_warn "Update failed for ${dest}; continuing with existing checkout."
+  elif [[ -d "$dest" ]]; then
+    log_warn "${dest} exists but is not a git repo; leaving untouched."
+  else
+    log_info "Cloning $(basename "$dest")…"
+    git clone --depth=1 "$url" "$dest"
+  fi
+}
+
+install_zsh_p10k() {
+  section "Zsh + Oh My Zsh + Powerlevel10k"
+  command_exists zsh || ensure_dnf_packages zsh
+  ensure_dnf_packages git curl fontconfig
+
+  # --- Meslo Nerd Font (Powerlevel10k's recommended font), user-space ---
+  local font_dir="$HOME/.local/share/fonts"
+  mkdir -p "$font_dir"
+  if fc-list 2>/dev/null | grep -qi "MesloLGS"; then
+    log_info "Meslo Nerd Font already installed."
+  else
+    log_info "Installing Meslo Nerd Font into ${font_dir}…"
+    local base="https://github.com/romkatv/powerlevel10k-media/raw/master"
+    local f
+    for f in "MesloLGS%20NF%20Regular.ttf" "MesloLGS%20NF%20Bold.ttf" \
+             "MesloLGS%20NF%20Italic.ttf" "MesloLGS%20NF%20Bold%20Italic.ttf"; do
+      local out="$font_dir/$(printf '%s' "$f" | sed 's/%20/ /g')"
+      [[ -f "$out" ]] || curl -fsSL -o "$out" "$base/$f" || log_warn "Font download failed: $f"
+    done
+    fc-cache -f "$font_dir" &>/dev/null || true
+    fc-list 2>/dev/null | grep -qi "MesloLGS" \
+      && log_success "Meslo Nerd Font installed (select 'MesloLGS NF' in kitty/terminal font settings)." \
+      || log_warn "Meslo font not detected by fontconfig; set your terminal font to 'MesloLGS NF' manually."
+  fi
+
+  # --- Oh My Zsh (unattended, keep existing .zshrc) ---
+  local omz_dir="$HOME/.oh-my-zsh"
+  if [[ -d "$omz_dir" ]]; then
+    log_info "Oh My Zsh already installed; updating…"
+    git -C "$omz_dir" pull --ff-only 2>/dev/null || log_warn "Oh My Zsh update failed; continuing."
+  else
+    log_info "Installing Oh My Zsh (unattended, keep-zshrc)…"
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended --keep-zshrc
+  fi
+  local zsh_custom="${ZSH_CUSTOM:-$omz_dir/custom}"
+  mkdir -p "$zsh_custom/themes" "$zsh_custom/plugins"
+
+  # --- Plugins: all necessary for dev (external + OMZ builtins) ---
+  git_clone_or_update "https://github.com/zsh-users/zsh-autosuggestions.git" "$zsh_custom/plugins/zsh-autosuggestions"
+  git_clone_or_update "https://github.com/zsh-users/zsh-syntax-highlighting.git" "$zsh_custom/plugins/zsh-syntax-highlighting"
+  git_clone_or_update "https://github.com/zsh-users/zsh-completions.git" "$zsh_custom/plugins/zsh-completions"
+
+  # --- Powerlevel10k theme ---
+  git_clone_or_update "https://github.com/romkatv/powerlevel10k.git" "$zsh_custom/themes/powerlevel10k"
+
+  # --- ~/.zshrc: create from OMZ template if missing, then enforce theme/plugins ---
+  touch "$HOME/.zshrc"
+  if ! grep -q "oh-my-zsh" "$HOME/.zshrc" 2>/dev/null; then
+    if [[ -f "$omz_dir/templates/zshrc.zsh-template" ]]; then
+      log_info "Seeding ~/.zshrc from Oh My Zsh template…"
+      cp "$omz_dir/templates/zshrc.zsh-template" "$HOME/.zshrc"
+    fi
+  fi
+  if grep -qE '^ZSH_THEME=' "$HOME/.zshrc"; then
+    sed -i -E 's|^ZSH_THEME=.*|ZSH_THEME="powerlevel10k/powerlevel10k"|' "$HOME/.zshrc"
+  else
+    printf '%s\n' 'ZSH_THEME="powerlevel10k/powerlevel10k"' >>"$HOME/.zshrc"
+  fi
+  local dev_plugins='plugins=(git gh docker python pip node npm rust cargo golang sudo command-not-found colored-man-pages direnv zsh-autosuggestions zsh-syntax-highlighting zsh-completions)'
+  if grep -qE '^plugins=\(' "$HOME/.zshrc"; then
+    sed -i -E "s|^plugins=\(.*|${dev_plugins}|" "$HOME/.zshrc"
+  else
+    printf '%s\n' "$dev_plugins" >>"$HOME/.zshrc"
+  fi
+  # p10k instant-prompt preamble belongs at the very top of .zshrc.
+  if ! grep -q "p10k-instant-prompt" "$HOME/.zshrc"; then
+    local tmp_zsh
+    tmp_zsh="$(mktemp)"
+    cat >"$tmp_zsh" <<'PREAMBLE_EOF'
+# Enable Powerlevel10k instant prompt (keep near the top of ~/.zshrc).
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+PREAMBLE_EOF
+    cat "$HOME/.zshrc" >>"$tmp_zsh"
+    cat "$tmp_zsh" >"$HOME/.zshrc"
+    rm -f "$tmp_zsh"
+  fi
+  # Load existing (or future, post-wizard) p10k config.
+  ensure_line_in_file '[[ ! -f ~/.p10k.zsh ]] || source ~/.p10k.zsh' "$HOME/.zshrc"
+  log_success "Oh My Zsh + Powerlevel10k wired in ~/.zshrc."
+
+  # --- Default shell → zsh ---
+  if [[ "${SHELL:-}" == *"zsh"* ]] || [[ "$(getent passwd "$USER" 2>/dev/null | cut -d: -f7 || echo "")" == *"zsh" ]]; then
+    log_info "Default login shell is already zsh."
+  else
+    log_info "Setting zsh as the default login shell…"
+    if chsh -s "$(command -v zsh)" "$USER"; then
+      log_warn "Default shell changed to zsh — log out and back in for it to take effect."
+    else
+      log_warn "chsh failed; run manually: chsh -s \$(command -v zsh)"
+    fi
+  fi
+
+  # --- Interactive `p10k configure` wizard (never overwrites existing config) ---
+  if [[ -f "$HOME/.p10k.zsh" ]]; then
+    log_info "~/.p10k.zsh already exists; skipping wizard (run 'p10k configure' to re-run it)."
+  elif [[ "$NONINTERACTIVE" != "1" ]] && [[ -t 0 ]] && [[ -t 1 ]]; then
+    log_info "Launching interactive 'p10k configure' wizard…"
+    zsh -i -c 'p10k configure' || log_warn "'p10k configure' exited; re-run it later with: p10k configure"
+  else
+    log_info "Skipping interactive 'p10k configure' (non-interactive or no TTY). After restarting your shell, run: p10k configure"
+  fi
+  log_success "Zsh setup complete."
+}
+
 # ---------------------------------------------------------------------------
 # 4. Polyglot runtimes & version managers (user-space)
 # ---------------------------------------------------------------------------
@@ -705,13 +941,9 @@ configure_shells() {
   block="$(build_shell_block)"
   ensure_managed_block "$HOME/.bashrc" "$block"
   log_info "~/.bashrc wired (managed block upserted)."
-  # Only touch .zshrc if zsh is installed or the file already exists.
-  if command_exists zsh || [[ -f "$HOME/.zshrc" ]]; then
-    ensure_managed_block "$HOME/.zshrc" "$block"
-    log_info "~/.zshrc wired (managed block upserted)."
-  else
-    log_warn "zsh not installed; skipping ~/.zshrc (install zsh and re-run to wire it)."
-  fi
+  # zsh is a hard requirement now (OMZ + p10k installer above guarantees it).
+  ensure_managed_block "$HOME/.zshrc" "$block"
+  log_info "~/.zshrc wired (managed block upserted; OMZ/p10k lines preserved)."
   log_success "Shell configuration complete (re-run safe: block is replaced, never duplicated)."
 }
 
@@ -780,6 +1012,29 @@ run_verification() {
   else
     log_warn "${failures} core tool(s) MISSING — see table above. Re-run the script, then check Post-install notes."
   fi
+  # Informational (non-failing) Zsh/OMZ/p10k checks.
+  local _zsh_custom="${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}"
+  [[ -d "$HOME/.oh-my-zsh" ]] \
+    && log_success "Oh My Zsh present (~/.oh-my-zsh)." \
+    || log_warn "Oh My Zsh MISSING (~/.oh-my-zsh)."
+  [[ -d "$_zsh_custom/themes/powerlevel10k" ]] \
+    && log_success "Powerlevel10k theme present." \
+    || log_warn "Powerlevel10k theme MISSING."
+  for _plug in zsh-autosuggestions zsh-syntax-highlighting zsh-completions; do
+    [[ -d "$_zsh_custom/plugins/$_plug" ]] \
+      && log_info "zsh plugin present: $_plug" \
+      || log_warn "zsh plugin MISSING: $_plug"
+  done
+  [[ -f "$HOME/.p10k.zsh" ]] \
+    && log_info "~/.p10k.zsh configured." \
+    || log_info "~/.p10k.zsh not yet created — run 'p10k configure'."
+  # Informational (non-failing) kitty checks.
+  [[ -f "$HOME/.config/kitty/fedora-dev.conf" ]] \
+    && log_success "Kitty drop-in present (Catppuccin Mocha, JetBrainsMono NF 13)." \
+    || log_warn "Kitty drop-in MISSING (~/.config/kitty/fedora-dev.conf)."
+  fc-list 2>/dev/null | grep -qi "JetBrainsMono.*Nerd" \
+    && log_info "JetBrainsMono Nerd Font detected." \
+    || log_info "JetBrainsMono Nerd Font not detected — check ~/.local/share/fonts."
   VERIFY_REPORT_FILE="$report"
 }
 
@@ -802,22 +1057,31 @@ print_summary() {
   │ Java               │ java-21-openjdk-devel (+ SDKMAN! if asked)  │
   │ Containers         │ podman stack (+ Docker CE if --docker)      │
   │ Virtualization     │ qemu-kvm, libvirt, virt-manager, libvirtd  │
+  │ Zsh                │ Oh My Zsh + Powerlevel10k, dev plugins,     │
+  │                    │ Meslo Nerd Font, zsh default shell         │
+  │ Kitty              │ Catppuccin Mocha, JetBrainsMono Nerd 13,   │
+  │                    │ drop-in conf, GNOME default terminal       │
   │ Shell              │ Managed PATH block in ~/.bashrc + ~/.zshrc  │
   └────────────────────┴──────────────────────────────────────────────┘
 EOF
   echo ""
   log_info "NEXT STEPS (important):"
-  echo "  1. Log out and back in for 'docker' / 'libvirt' group membership to take effect."
-  echo "     (Verify later with: id -nG)"
-  echo "  2. Restart your shell or run:  source ~/.bashrc   # or: source ~/.zshrc"
-  echo "  3. Confirm runtimes:"
+  echo "  1. Log out and back in for 'docker' / 'libvirt' group membership AND the new"
+  echo "     zsh default shell to take effect. (Verify later with: id -nG; echo \$SHELL)"
+  echo "  2. Restart your shell or run:  source ~/.zshrc   # zsh is now the default"
+  echo "  3. If the 'p10k configure' wizard did not run, launch it manually:"
+  echo "       p10k configure"
+  echo "     (Requires a Nerd Font — JetBrainsMono NF is installed; select it"
+  echo "      in kitty if glyphs look off: kitty font is preconfigured to size 13.)"
+  echo "  4. Confirm runtimes:"
   echo "       node --version && pnpm --version && yarn --version"
   echo "       uv --version && pyenv --versions"
   echo "       rustc --version && cargo --version"
   echo "       go version && echo \$GOPATH"
   echo "       java -version"
-  echo "  4. This script is idempotent — re-run anytime with:"
+  echo "  5. This script is idempotent — re-run anytime with:"
   echo "       ./$SCRIPT_NAME"
+  echo "     Your ~/.p10k.zsh is never overwritten on re-runs."
   echo "     Add Docker/SDKMAN later with: ./$SCRIPT_NAME --docker --sdkman"
   echo "  5. Full log saved to: $LOG_FILE"
   if [[ -n "${VERIFY_REPORT_FILE:-}" ]]; then
@@ -845,6 +1109,8 @@ main() {
   install_build_essentials
   install_cli_toolkit
   install_editors_terminals
+  configure_kitty
+  install_zsh_p10k
 
   install_fnm_node
   install_uv_pyenv
